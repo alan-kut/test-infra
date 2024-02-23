@@ -55,6 +55,7 @@ var (
 	gkeCreateCommand               = flag.String("gke-create-command", defaultCreate, "(gke only) gcloud subcommand used to create a cluster. Modify if you need to pass arbitrary arguments to create.")
 	gkeCustomSubnet                = flag.String("gke-custom-subnet", "", "(gke only) if specified, we create a custom subnet with the specified options and use it for the gke cluster. The format should be '<subnet-name> --region=<subnet-gcp-region> --range=<subnet-cidr> <any other optional params>'.")
 	gkeSubnetMode                  = flag.String("gke-subnet-mode", "auto", "(gke only) subnet creation mode of the GKE cluster network.")
+	gkeAdditionalNetworksShape     = flag.String("gke-additional-network-shape", "", `(gke only) A JSON description of node pools to create. Example: '[{"Name":"net1","SubnetMode":"custom","Subnets":[{"Name":"sub1","Range":"10.0.0.0/14","SecondaryRanges":[{"Name":"sec1","Range":"10.4.0.0/14"},{"Name":"sec2","Range":"10.8.0.0/14"}]},{"Name":"sub2","Range":"10.12.0.0/14","SecondaryRanges":[{"Name":"sec1","Range":"10.16.0.0/14"},{"Name":"sec2","Range":"10.20.0.0/14"}]}]},{"Name":"net2","SubnetMode":"custom","Subnets":[{"Name":"sub1","Range":"10.24.0.0/14","SecondaryRanges":[{"Name":"sec1","Range":"10.28.0.0/14"},{"Name":"sec2","Range":"10.32.0.0/14"}]},{"Name":"sub2","Range":"10.36.0.0/14","SecondaryRanges":[{"Name":"sec1","Range":"10.40.0.0/14"},{"Name":"sec2","Range":"10.44.0.0/14"}]}]}]'`)
 	gkeReleaseChannel              = flag.String("gke-release-channel", "", "(gke only) if specified, bring up GKE clusters from that release channel.")
 	gkeSingleZoneNodeInstanceGroup = flag.Bool("gke-single-zone-node-instance-group", true, "(gke only) Add instance groups from a single zone to the NODE_INSTANCE_GROUP env variable.")
 	gkeInstanceGroupPrefix         = flag.String("gke-instance-group-prefix", "gke", "(gke only) Use a different instance group prefix.")
@@ -83,6 +84,23 @@ type gkeNodePool struct {
 	ExtraArgs   []string
 }
 
+type gkeNetwork struct {
+	Name       string
+	SubnetMode string
+	Subnets    []gkeSubnetwork
+}
+
+type gkeSubnetwork struct {
+	Name            string
+	Range           string
+	SecondaryRanges []gkeSecondaryRange
+}
+
+type gkeSecondaryRange struct {
+	Name  string
+	Range string
+}
+
 type gkeConfigMap struct {
 	Name      string
 	Namespace string
@@ -104,6 +122,7 @@ type gkeDeployer struct {
 	subnetwork                  string
 	subnetMode                  string
 	subnetworkRegion            string
+	additionalNetworksShape     []gkeNetwork
 	createNat                   bool
 	natMinPortsPerVm            int
 	image                       string
@@ -165,6 +184,12 @@ func newGKE(provider, project, zone, region, network, image, imageFamily, imageP
 		return nil, fmt.Errorf("--gcp-network must be set for GKE deployment")
 	}
 	g.network = network
+	if *gkeAdditionalNetworksShape != "" {
+		err := json.Unmarshal([]byte(*gkeAdditionalNetworksShape), &g.additionalNetworksShape)
+		if err != nil {
+			return nil, fmt.Errorf("--gke-additional-network-shape must be valid JSON, unmarshal error: %v, JSON: %q", err, *gkeAdditionalNetworksShape)
+		}
+	}
 
 	if strings.ToUpper(image) == "CUSTOM" {
 		if imageFamily == "" || imageProject == "" {
@@ -318,6 +343,48 @@ func newGKE(provider, project, zone, region, network, image, imageFamily, imageP
 	return g, nil
 }
 
+func (g *gkeDeployer) setupNetwork(network gkeNetwork) error {
+	// Create network if it doesn't exist.
+	if control.NoOutput(exec.Command("gcloud", "compute", "networks", "describe", network.Name,
+		"--project="+g.project,
+		"--format=value(name)")) != nil {
+		// Assume error implies non-existent.
+		log.Printf("Couldn't describe network '%s', assuming it doesn't exist and creating it", network.Name)
+		if err := control.FinishRunning(exec.Command("gcloud", "compute", "networks", "create", network.Name,
+			"--project="+g.project,
+			"--subnet-mode="+network.SubnetMode)); err != nil {
+			return err
+		}
+	}
+	region, err := g.getRegion(g.region, g.zone)
+	if err != nil {
+		return err
+	}
+	for _, subnet := range network.Subnets {
+		if control.NoOutput(exec.Command("gcloud", "compute", "networks", "subnets", "describe", subnet.Name,
+			"--region="+region,
+			"--project="+g.project,
+			"--format=value(name)")) != nil {
+			// Assume error implies non-existent.
+			log.Printf("Couldn't describe subnetwork '%s', assuming it doesn't exist and creating it", network.Name)
+			var secondaryRangesParts []string
+			for _, secondaryRange := range subnet.SecondaryRanges {
+				secondaryRangesParts = append(secondaryRangesParts, secondaryRange.Name+"="+secondaryRange.Range)
+			}
+			secondaryRanges := strings.Join(secondaryRangesParts, ",")
+			if err := control.FinishRunning(exec.Command("gcloud", "compute", "networks", "subnets", "create", subnet.Name,
+				"--project="+g.project,
+				"--network="+network.Name,
+				"--region="+region,
+				"--range="+subnet.Range,
+				"--secondary-range="+secondaryRanges)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (g *gkeDeployer) Up() error {
 	// Create network if it doesn't exist.
 	if control.NoOutput(exec.Command("gcloud", "compute", "networks", "describe", g.network,
@@ -329,6 +396,15 @@ func (g *gkeDeployer) Up() error {
 			"--project="+g.project,
 			"--subnet-mode="+g.subnetMode)); err != nil {
 			return err
+		}
+	}
+
+	if g.additionalNetworksShape != nil {
+		for _, network := range g.additionalNetworksShape {
+			err := g.setupNetwork(network)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -994,6 +1070,27 @@ func (g *gkeDeployer) Down() error {
 	errNat := g.cleanupNat()
 
 	var errSubnet error
+	var errAdditionalNetowrk []error
+	var errAdditionalSubnetwork []error
+	if g.additionalNetworksShape != nil {
+		region, errRegion := g.getRegion(g.region, g.zone)
+		if errRegion != nil {
+			errAdditionalNetowrk = append(errAdditionalNetowrk, errRegion)
+		} else {
+			for _, network := range g.additionalNetworksShape {
+				for _, subnetwork := range network.Subnets {
+					errAdditionalSubnetwork = append(errAdditionalSubnetwork,
+						control.FinishRunning(
+							exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", subnetwork.Name, "--region="+region, "--project="+g.project)))
+				}
+				if network.Name != g.network {
+					errAdditionalNetowrk = append(errAdditionalNetowrk,
+						control.FinishRunning(
+							exec.Command("gcloud", "compute", "networks", "delete", "-q", network.Name, "--project="+g.project)))
+				}
+			}
+		}
+	}
 	if g.subnetwork != "" {
 		errSubnet = control.FinishRunning(exec.Command("gcloud", "compute", "networks", "subnets", "delete", "-q", g.subnetwork,
 			g.subnetworkRegion, "--project="+g.project))
@@ -1020,6 +1117,16 @@ func (g *gkeDeployer) Down() error {
 	}
 	if errNetwork != nil {
 		return fmt.Errorf("error deleting network: %w", errNetwork)
+	}
+	for _, err = range errAdditionalNetowrk {
+		if err != nil {
+			return fmt.Errorf("error deleting additional network: %w", err)
+		}
+	}
+	for _, err = range errAdditionalSubnetwork {
+		if err != nil {
+			return fmt.Errorf("error deleting additional subnetwork: %w", err)
+		}
 	}
 	if numLeakedFWRules > 0 {
 		// Leaked firewall rules are cleaned up already, print a warning instead of failing hard
